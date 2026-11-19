@@ -162,7 +162,13 @@
   <h1>Bhuni Dada Public School, Gumgaon</h1>
   <div class="sub">Ward No. 9, Chand Road, Gumgaon, Teh Chand, Dist Chhindwara, (MP) PIN 480110 | Phone : +91 76490 34472
 Email : bdpsschool04@gmail.com | Aff. No. PS70186 | Dise code - 23431118003</div>
-  <div class="portal"> <a href="https://trukart.vercel.app">TruKart Shop Now</a></div>
+  <div class="portal">
+  <a href="https://trukart.vercel.app"
+     target="_self"
+     onclick="openTruKart(event)">
+    TruKart Shop Now
+  </a>
+</div>
 </header>
 
 <main>
@@ -242,6 +248,12 @@ Email : bdpsschool04@gmail.com | Aff. No. PS70186 | Dise code - 23431118003</div
     var url = LINKS[a.getAttribute('data-key')];
     if(url) a.href = url;
   });
+</script>
+  <script>
+function openTruKart(event) {
+  event.preventDefault();
+  window.location.href = "https://trukart.vercel.app";
+}
 </script>
 </body>
 </html>
