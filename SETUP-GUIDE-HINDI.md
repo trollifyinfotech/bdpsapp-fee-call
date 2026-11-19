@@ -1,5 +1,15 @@
 # Trollify सेटअप गाइड (हिंदी) — Node.js / CLI / Edge Functions की ज़रूरत नहीं
 
+> **पहले से install है? (पुराना version चल रहा है)** तो `ALL_IN_ONE.sql` दोबारा **मत** चलाइए।
+> सिर्फ़ `supabase/migrations/010_delete_and_shared_tasks.sql` का पूरा content SQL Editor में paste करके **एक बार Run** कीजिए,
+> फिर नई website files (पूरा folder) Netlify पर दोबारा upload कीजिए।
+
+## नए features (010)
+- **Student को permanently delete:** Students list में student चुनिए (या student खोलिए) → *Delete permanently* (सिर्फ़ Owner/Principal)। Reason लिखना ज़रूरी है। इससे student, उसकी class/fee setup, calling tasks और call history हट जाती है, इसलिए वही admission number दोबारा import हो सकता है। जिस student की **कोई भी fee जमा** हो चुकी है उसे delete नहीं किया जाता (Archive कीजिए), क्योंकि payment record हमेशा रहता है।
+- **Archived students देखना:** Students list में *Status → Archived* चुनिए।
+- **एक student कई teachers को:** Calling CRM → Task Assignment में *Same student to every selected teacher* टिक कीजिए, या मौजूदा task पर हरा "+ person" बटन दबाइए। कोई भी एक teacher task पूरा करे (या पूरी fee जमा हो जाए) तो वह सबके पास से हट जाता है।
+
+
 बस 3 चीज़ें चाहिए: Supabase project का **URL**, **anon key**, और website host करने की जगह।
 
 1. **supabase.com** पर free account बनाकर New Project बनाइए (Region: Mumbai)।

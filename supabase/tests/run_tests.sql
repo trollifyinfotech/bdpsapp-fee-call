@@ -1,6 +1,6 @@
 -- =====================================================================
 -- Trollify database tests: business logic + RLS (allowed AND denied).
--- Run against a scratch database after applying migrations 001-009:
+-- Run against a scratch database after applying migrations 001-010:
 --   psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/tests/run_tests.sql
 -- Requires a superuser connection (it impersonates users via SET ROLE).
 -- Everything is rolled back at the end; nothing persists.
@@ -367,6 +367,104 @@ begin
   perform pg_temp.check('49. run_my_reminders runs then throttles', (public.run_my_reminders() ->> 'ran')::boolean and not (public.run_my_reminders() ->> 'ran')::boolean);
   perform pg_temp.as_user(null);
   perform pg_temp.denied('49b. anon cannot run reminders', 'select public.run_my_reminders()');
+
+  -- ---------- 010: shared calling tasks + permanent delete ----------
+  declare
+    tch3 uuid := gen_random_uuid(); s1 uuid; s2 uuid; s3 uuid; s4 uuid; s5 uuid; e1 uuid; e4 uuid; tk uuid; tk2 uuid; res jsonb; jb jsonb; nn int;
+  begin
+    perform pg_temp.as_admin();
+    insert into auth.users (id, email) values (tch3, 't3@x');
+    insert into public.school_memberships (school_id, user_id, role_code) values (schA, tch3, 'teacher');
+    perform pg_temp.as_user(ownerA);
+    s1 := public.add_student('{"name":"Share Kid","admission_no":"SH1","mobile":"9876511001"}', sess, 'Class 3', 'A', '1', 'general', 6000);
+    s2 := public.add_student('{"name":"Share Two","admission_no":"SH2","mobile":"9876511002"}', sess, 'Class 3', 'A', '2', 'general', 6000);
+    select id into e1 from public.student_session_enrollments where student_id = s1 and session_id = sess;
+    res := public.create_calling_tasks(sess, 'students', null, array[s1], array[tch1, tch2], 'normal', null, true);
+    perform pg_temp.check('50. one student shared with TWO teachers = one task', (res ->> 'created')::int = 1
+       and (select count(*) from public.calling_tasks where student_id = s1 and status = 'pending') = 1
+       and (select co_assignees from public.calling_tasks where student_id = s1) = array[tch2], res::text);
+    perform pg_temp.as_user(tch1);
+    perform pg_temp.check('50b. teacher 1 sees the shared student', exists (select 1 from jsonb_array_elements(public.crm_list(sess,'mine') -> 'rows') x where x ->> 'name' = 'Share Kid'));
+    perform pg_temp.as_user(tch2);
+    perform pg_temp.check('50c. teacher 2 sees the SAME student', exists (select 1 from jsonb_array_elements(public.crm_list(sess,'mine') -> 'rows') x where x ->> 'name' = 'Share Kid'));
+    perform pg_temp.check('50d. both names shown as assignees', exists (select 1 from jsonb_array_elements(public.crm_list(sess,'mine') -> 'rows') x
+         where x ->> 'name' = 'Share Kid' and x ->> 'assigned_name' like '%Teacher One%' and x ->> 'assigned_name' like '%Teacher Two%'), '');
+    select (x ->> 'task_id')::uuid into tk from jsonb_array_elements(public.crm_list(sess,'mine') -> 'rows') x where x ->> 'name' = 'Share Kid';
+    perform public.log_call(s1, sess, tk, 'not_answered', 'Teacher two tried');
+    perform pg_temp.check('51. second (shared) teacher can log a call', (select call_count from public.calling_tasks where id = tk) = 1);
+    perform pg_temp.as_user(tch3);
+    perform pg_temp.check('52. unrelated teacher does not see the shared student', not exists (select 1 from jsonb_array_elements(public.crm_list(sess,'mine') -> 'rows') x where x ->> 'name' = 'Share Kid'));
+    perform pg_temp.denied('52b. unrelated teacher cannot log on shared task', format($q$select public.log_call(%L,%L,%L,'connected','not mine')$q$, s1, sess, tk));
+    perform pg_temp.as_user(ownerA);
+    perform public.collect_payment(e1, 6000, current_date, 'cash');
+    perform pg_temp.as_admin();
+    perform pg_temp.check('53. full fee closes the shared task for everyone', (select status from public.calling_tasks where id = tk) = 'completed');
+    perform pg_temp.as_user(tch1);
+    perform pg_temp.check('53b. gone from teacher 1', not exists (select 1 from jsonb_array_elements(public.crm_list(sess,'mine') -> 'rows') x where x ->> 'name' = 'Share Kid'));
+    perform pg_temp.as_user(tch2);
+    perform pg_temp.check('53c. gone from teacher 2', not exists (select 1 from jsonb_array_elements(public.crm_list(sess,'mine') -> 'rows') x where x ->> 'name' = 'Share Kid'));
+    -- sharing onto an EXISTING single-teacher task, then completing it by the second teacher
+    perform pg_temp.as_user(ownerA);
+    res := public.create_calling_tasks(sess, 'students', null, array[s2], array[tch1], 'normal', null, false);
+    res := public.create_calling_tasks(sess, 'students', null, array[s2], array[tch1, tch2], 'normal', null, true);
+    perform pg_temp.check('54. existing task gets extra teacher', (res ->> 'shared_added')::int = 1 and (res ->> 'created')::int = 0
+       and (select co_assignees from public.calling_tasks where student_id = s2 and status = 'pending') = array[tch2], res::text);
+    select id into tk2 from public.calling_tasks where student_id = s2 and status = 'pending';
+    perform pg_temp.as_user(tch2);
+    perform public.log_call(s2, sess, tk2, 'connected', 'Parent will pay at month end');
+    perform public.complete_task(tk2);
+    perform pg_temp.as_user(tch1);
+    perform pg_temp.check('55. completed by teacher 2 -> removed from teacher 1 too', (select status from public.calling_tasks where id = tk2) = 'completed'
+       and not exists (select 1 from jsonb_array_elements(public.crm_list(sess,'mine') -> 'rows') x where x ->> 'name' = 'Share Two'));
+    perform pg_temp.as_user(ownerA);
+    perform public.teacher_performance(sess); perform public.crm_dashboard(sess);
+    perform pg_temp.check('55b. performance / dashboard still work with shared tasks', true);
+    perform pg_temp.as_user(tch1);
+    perform pg_temp.denied('55c. teacher cannot add co-assignees', format($q$select public.add_task_assignee(%L,%L)$q$, tk2, tch3));
+
+    -- permanent delete
+    perform pg_temp.as_user(ownerA);
+    s3 := public.add_student('{"name":"Wrong Entry","admission_no":"WE1","mobile":"9876512001"}', sess, 'LKG', 'A', '1', 'general', 6000);
+    s4 := public.add_student('{"name":"Paid Kid","admission_no":"WE2","mobile":"9876512002"}', sess, 'LKG', 'A', '2', 'general', 6000);
+    s5 := public.add_student('{"name":"Archived Wrong","admission_no":"WE3","mobile":"9876512003"}', sess, 'LKG', 'A', '3', 'general', 6000);
+    select id into e4 from public.student_session_enrollments where student_id = s4 and session_id = sess;
+    perform public.collect_payment(e4, 1000, current_date, 'cash');
+    res := public.create_calling_tasks(sess, 'students', null, array[s3], array[tch1], 'normal', null, false);
+    select id into tk from public.calling_tasks where student_id = s3 and status = 'pending';
+    perform pg_temp.as_user(tch1);
+    perform public.log_call(s3, sess, tk, 'connected', 'Called wrong-entry student');
+    perform pg_temp.as_user(tch2);
+    perform pg_temp.denied('56. teacher cannot delete students', format($q$select public.delete_students_permanently(array[%L]::uuid[], 'wrong entry')$q$, s3));
+    perform pg_temp.as_user(acct);
+    perform pg_temp.denied('56b. accountant cannot delete students', format($q$select public.delete_students_permanently(array[%L]::uuid[], 'wrong entry')$q$, s3));
+    perform pg_temp.as_user(ownerB);
+    res := public.delete_students_permanently(array[s3], 'cross school attempt');
+    perform pg_temp.check('56c. other school owner cannot delete my student', (res ->> 'deleted')::int = 0);
+    perform pg_temp.as_user(ownerA);
+    perform pg_temp.denied('56d. reason is mandatory', format($q$select public.delete_students_permanently(array[%L]::uuid[], '')$q$, s3));
+    perform public.archive_student(s5, 'Entered by mistake');
+    res := public.delete_students_permanently(array[s3, s4, s5], 'Wrong entries - LKG import');
+    perform pg_temp.check('57. wrong entries (incl. archived, with tasks & call history) are deleted', (res ->> 'deleted')::int = 2, res::text);
+    perform pg_temp.check('57b. student with a payment is protected', (res -> 'skipped' -> 0 ->> 'name') = 'Paid Kid'
+       and exists (select 1 from public.students where id = s4), res::text);
+    perform pg_temp.as_admin();
+    perform pg_temp.check('57c. rows fully gone, history cleaned, audit kept',
+       not exists (select 1 from public.students where id in (s3, s5))
+       and not exists (select 1 from public.calling_logs where student_id = s3)
+       and not exists (select 1 from public.calling_tasks where student_id in (s3, s5))
+       and exists (select 1 from public.audit_logs where action = 'student.deleted_permanently' and reason = 'Wrong entries - LKG import'));
+    perform pg_temp.denied('57d. call history is still append-only outside the purge', $q$delete from public.calling_logs$q$);
+    -- re-import after deletion works; archived duplicates are reported clearly
+    perform pg_temp.as_user(ownerA);
+    jb := public.start_import(sess, 'again.csv', 'hash-again', 1);
+    res := public.import_students_batch((jb ->> 'batch_id')::uuid, '[{"name":"Wrong Entry","father_name":"F","admission_no":"WE1","class_name":"LKG","mobile":"9876512001","annual_fee":"5000"}]');
+    perform pg_temp.check('58. same admission no can be imported again after permanent delete', (res ->> 'imported')::int = 1, res::text);
+    perform public.archive_student((select id from public.students where admission_no = 'WE1' and school_id = schA), 'again wrong');
+    jb := public.start_import(sess, 'again2.csv', 'hash-again2', 1);
+    res := public.import_students_batch((jb ->> 'batch_id')::uuid, '[{"name":"Wrong Entry","father_name":"F","admission_no":"WE1","class_name":"LKG","mobile":"9876512001","annual_fee":"5000"}]');
+    perform pg_temp.check('58b. import says the student is ARCHIVED', (res ->> 'imported')::int = 0
+       and exists (select 1 from public.import_errors where errors[1] like '%ARCHIVED%'), res::text);
+  end;
 end $t$;
 
 reset role;

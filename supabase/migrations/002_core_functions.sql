@@ -188,6 +188,10 @@ end $$;
 -- ---------------------------------------------------------------------
 create or replace function public.forbid_delete() returns trigger language plpgsql as $$
 begin
+  -- only delete_students_permanently() sets this flag; it first refuses students with payments / fee adjustments / RTE reimbursements
+  if tg_table_name in ('task_assignment_history','calling_logs') and current_setting('app.student_purge', true) = 'on' then
+    return old;
+  end if;
   raise exception 'Deleting % records is not allowed (append-only). Use cancellation/reversal.', tg_table_name
     using errcode = '42501';
 end $$;
@@ -342,7 +346,8 @@ insert into public.permissions (code, name, category) values
  ('view_student_list','View Student List','Students'),
  ('add_student','Add Student','Students'),
  ('edit_student','Edit Student','Students'),
- ('archive_student','Delete/Archive Student','Students'),
+ ('archive_student','Archive Student','Students'),
+ ('delete_student','Delete Student Permanently (wrong entries)','Students'),
  ('import_students','Import Students','Students'),
  ('manage_families','Manage Families & Siblings','Students'),
  ('manage_rte','Manage RTE & Scholarships','Students'),

@@ -693,6 +693,8 @@ begin
         if found then
           if lower(ex.name) <> lower(nm) then
             errs := array_append(errs, ('Admission No already used by a different student (' || ex.name || ')'));
+          elsif ex.status = 'archived' then
+            errs := array_append(errs, 'An ARCHIVED student with this admission no exists. Delete it permanently (Students > Archived) or restore it, then import again'); kind := 'duplicate';
           elsif exists (select 1 from public.student_session_enrollments where student_id=ex.id and session_id=b.session_id) then
             errs := array_append(errs, 'Already imported (same admission no & session) - skipped'); kind := 'duplicate';
           else

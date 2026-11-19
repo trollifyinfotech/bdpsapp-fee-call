@@ -23,6 +23,7 @@
     root.innerHTML = `<div class="page-h"><div><h1>Students</h1><div class="sub">Session: <b>${T.esc(T.sessions.current()?.name || "—")}</b></div></div>
       <div class="d-flex flex-wrap gap-2">${T.can("export_csv") ? `<button class="btn btn-outline-secondary" id="st-exp"><i class="bi bi-download me-1"></i>Export</button>` : ""}
       ${T.can("import_students") ? `<a class="btn btn-outline-primary" href="#/students/import"><i class="bi bi-file-earmark-arrow-up me-1"></i>Import</a>` : ""}
+      ${T.can("delete_student") ? `<button class="btn btn-danger d-none" id="st-del"><i class="bi bi-trash me-1"></i>Delete selected permanently (<span id="st-n">0</span>)</button>` : ""}
       ${T.can("add_student") ? `<button class="btn btn-primary" id="st-add"><i class="bi bi-person-plus me-1"></i>Add Student</button>` : ""}</div></div>
       <div class="card mb-3"><div class="card-body filters row g-2">
         <div class="col-md-4"><input class="form-control" id="f-q" placeholder="Search name, father, admission no, student ID, mobile"></div>
@@ -36,7 +37,9 @@
       T.loading(list);
       try {
         const { data, count } = await T.q(applyFilters(window.sb.from("students").select(SEL, { count: "exact" }), f).order("name").range(page * size, page * size + size - 1));
+        const canDel = T.can("delete_student");
         list.innerHTML = T.table([
+          ...(canDel ? [{ label: `<input type="checkbox" class="form-check-input" id="st-all" title="Select all on this page">`, render: (s) => `<input type="checkbox" class="form-check-input st-sel" value="${s.id}">` }] : []),
           { label: "Student ID", render: (s) => `<span class="text-muted small">${T.esc(s.student_code)}</span>` },
           { label: "Adm No", key: "admission_no" },
           { label: "Name", render: (s) => `<a href="#/students/${s.id}" class="fw-semibold text-decoration-none">${T.esc(s.name)}</a>${s.status !== "active" ? " " + T.badge(s.status) : ""}` },
@@ -45,7 +48,7 @@
           { label: "Roll", render: (s) => T.esc(enr(s).roll_no || "—") },
           { label: "Mobile", render: (s) => s.mobile ? `<a href="tel:${T.phone(s.mobile)}" class="text-decoration-none">${T.esc(s.mobile)}</a>` : "—" },
           { label: "Category", render: (s) => (enr(s).category === "general" ? "" : T.badge(enr(s).category === "rte" ? "rte" : "info", T.CATEGORIES[enr(s).category])) },
-          { label: "", cls: "text-end", render: (s) => `<div class="btn-group btn-group-sm"><a class="btn btn-outline-primary" href="#/students/${s.id}" title="View"><i class="bi bi-eye"></i></a>${T.can("edit_student") ? `<button class="btn btn-outline-secondary" data-edit="${s.id}" title="Edit"><i class="bi bi-pencil"></i></button>` : ""}${T.can("collect_fee") && s.status === "active" ? `<button class="btn btn-outline-success" data-pay="${enr(s).id}" title="Collect fee"><i class="bi bi-cash-coin"></i></button>` : ""}${T.can("archive_student") ? (s.status === "active" ? `<button class="btn btn-outline-danger" data-arch="${s.id}" title="Archive"><i class="bi bi-archive"></i></button>` : `<button class="btn btn-outline-success" data-restore="${s.id}" title="Restore"><i class="bi bi-arrow-counterclockwise"></i></button>`) : ""}</div>` },
+          { label: "", cls: "text-end", render: (s) => `<div class="btn-group btn-group-sm"><a class="btn btn-outline-primary" href="#/students/${s.id}" title="View"><i class="bi bi-eye"></i></a>${T.can("edit_student") ? `<button class="btn btn-outline-secondary" data-edit="${s.id}" title="Edit"><i class="bi bi-pencil"></i></button>` : ""}${T.can("collect_fee") && s.status === "active" ? `<button class="btn btn-outline-success" data-pay="${enr(s).id}" title="Collect fee"><i class="bi bi-cash-coin"></i></button>` : ""}${T.can("archive_student") ? (s.status === "active" ? `<button class="btn btn-outline-danger" data-arch="${s.id}" title="Archive"><i class="bi bi-archive"></i></button>` : `<button class="btn btn-outline-success" data-restore="${s.id}" title="Restore"><i class="bi bi-arrow-counterclockwise"></i></button>`) : ""}${T.can("delete_student") ? `<button class="btn btn-danger" data-del="${s.id}" data-nm="${T.esc(s.name)}" title="Delete permanently"><i class="bi bi-trash"></i></button>` : ""}</div>` },
         ], data, { empty: "No students found for the selected filters" });
         T.pager(root.querySelector("#st-pg"), count, page, size, (p) => { page = p; load(); });
         list.querySelectorAll("[data-edit]").forEach((b) => (b.onclick = () => T.students.form(b.dataset.edit, load)));
@@ -55,12 +58,18 @@
           if (!r) return;
           try { await T.rpc("archive_student", { p_student: b.dataset.arch, p_reason: r }, { mutates: true }); T.ok("Student archived"); load(); } catch (e) { T.fail(e); }
         }));
+        const upd = () => { const n = list.querySelectorAll(".st-sel:checked").length, b = root.querySelector("#st-del"); if (b) { b.classList.toggle("d-none", !n); root.querySelector("#st-n").textContent = n; } };
+        list.querySelectorAll(".st-sel").forEach((c) => (c.onchange = upd));
+        const all = list.querySelector("#st-all"); if (all) all.onchange = () => { list.querySelectorAll(".st-sel").forEach((c) => (c.checked = all.checked)); upd(); };
+        upd();
+        list.querySelectorAll("[data-del]").forEach((b) => (b.onclick = () => T.students.purge([b.dataset.del], b.dataset.nm, load)));
         list.querySelectorAll("[data-restore]").forEach((b) => (b.onclick = async () => { try { await T.rpc("restore_student", { p_student: b.dataset.restore }, { mutates: true }); T.ok("Student restored"); load(); } catch (e) { T.fail(e); } }));
       } catch (e) { list.innerHTML = T.errorBox(e); }
     };
     const apply = T.debounce(() => { f.q = T.val(root, "#f-q"); f.cls = T.val(root, "#f-c"); f.section = T.val(root, "#f-s"); f.status = T.val(root, "#f-st"); f.category = T.val(root, "#f-cat"); page = 0; load(); }, 350);
     ["#f-q", "#f-c", "#f-s", "#f-st", "#f-cat"].forEach((s) => root.querySelector(s).addEventListener("input", apply));
     const add = root.querySelector("#st-add"); if (add) add.onclick = () => T.students.form(null, load);
+    const del = root.querySelector("#st-del"); if (del) del.onclick = () => { const ids = [...list.querySelectorAll(".st-sel:checked")].map((c) => c.value); if (ids.length) T.students.purge(ids, ids.length + " selected student(s)", load); };
     const exp = root.querySelector("#st-exp");
     if (exp) exp.onclick = () => T.busy(exp, async () => {
       try {
@@ -75,6 +84,18 @@
 
   /* ---------------- ADD / EDIT FORM ---------------- */
   T.students = {
+    /** Permanently delete wrong-entry students (server refuses students that have fee payments). */
+    async purge(ids, label, done) {
+      const reason = await T.confirm({ title: "Delete permanently", danger: true, okText: "Delete permanently", reason: true, reasonLabel: "Reason (e.g. wrong entry)",
+        message: `<b>${T.esc(label)}</b> will be removed from the database <b>for good</b> together with their class record, fee set-up, calling tasks and call history. This cannot be undone.<br><span class="small text-muted">Students who have any fee payment are NOT deleted &mdash; archive those instead.</span>` });
+      if (!reason) return;
+      try {
+        const r = await T.rpc("delete_students_permanently", { p_students: ids, p_reason: reason }, { mutates: true });
+        if (r.deleted) T.ok(`${r.deleted} student(s) permanently deleted`);
+        if (r.skipped && r.skipped.length) T.modal({ title: `${r.skipped.length} student(s) NOT deleted`, size: "md", body: `<p class="small text-muted">These students have money records, so they were kept. Use Archive for them.</p>${T.table([{ label: "Student", render: (x) => T.esc(x.name) + ` <span class="text-muted small">${T.esc(x.student_code)}</span>` }, { label: "Reason", render: (x) => T.esc(x.reason), cls: "wrap" }], r.skipped)}` });
+        done && done(r);
+      } catch (e) { T.fail(e); }
+    },
     async form(studentId, done) {
       let s = {}, e = {};
       if (studentId) {
@@ -161,9 +182,10 @@
     if (s.photo_path) { try { photo = await T.signedUrl("student-photos", s.photo_path); } catch (_) {} }
     root.innerHTML = `<div class="page-h"><div class="d-flex align-items-center gap-3">${photo ? `<img src="${photo}" class="rounded-circle" style="width:56px;height:56px;object-fit:cover">` : `<div class="ic ic-p rounded-circle" style="width:56px;height:56px;display:grid;place-items:center;font-size:1.6rem"><i class="bi bi-person"></i></div>`}
       <div><h1>${T.esc(s.name)} ${T.badge(s.status)}</h1><div class="sub">${T.esc(s.student_code)} · Adm ${T.esc(s.admission_no)} · ${T.esc(cur.class_name || "—")}${cur.section ? "-" + T.esc(cur.section) : ""}</div></div></div>
-      <div class="d-flex gap-2"><a href="#/students" class="btn btn-light"><i class="bi bi-arrow-left me-1"></i>Back</a>${T.can("edit_student") ? `<button class="btn btn-outline-secondary" id="pf-edit"><i class="bi bi-pencil me-1"></i>Edit</button>` : ""}${T.can("collect_fee") && cur.id ? `<button class="btn btn-success" id="pf-pay"><i class="bi bi-cash-coin me-1"></i>Collect Fee</button>` : ""}</div></div><div id="pf-tabs"></div>`;
+      <div class="d-flex gap-2"><a href="#/students" class="btn btn-light"><i class="bi bi-arrow-left me-1"></i>Back</a>${T.can("edit_student") ? `<button class="btn btn-outline-secondary" id="pf-edit"><i class="bi bi-pencil me-1"></i>Edit</button>` : ""}${T.can("collect_fee") && cur.id ? `<button class="btn btn-success" id="pf-pay"><i class="bi bi-cash-coin me-1"></i>Collect Fee</button>` : ""}${T.can("delete_student") ? `<button class="btn btn-outline-danger" id="pf-del"><i class="bi bi-trash me-1"></i>Delete permanently</button>` : ""}</div></div><div id="pf-tabs"></div>`;
     const reload = () => T.pages["students/profile"](root, ctx);
     const ed = root.querySelector("#pf-edit"); if (ed) ed.onclick = () => T.students.form(id, reload);
+    const pdel = root.querySelector("#pf-del"); if (pdel) pdel.onclick = () => T.students.purge([id], s.name, (r) => { if (r.deleted) location.hash = "#/students"; });
     const pay = root.querySelector("#pf-pay"); if (pay) pay.onclick = () => T.payments.collect(cur.id, reload);
     const kv = (rows) => `<div class="row g-3">${rows.map(([k, v]) => `<div class="col-6 col-md-4"><div class="text-muted small">${k}</div><div class="fw-semibold">${v === null || v === undefined || v === "" ? "—" : v}</div></div>`).join("")}</div>`;
     const noPerm = (p) => `<div class="alert alert-secondary">You do not have the “${p}” permission to view this section.</div>`;

@@ -138,7 +138,7 @@ create policy reversals_read on public.transaction_reversals for select to authe
 -- ---------------------------------------------------------------------
 create policy tasks_read on public.calling_tasks for select to authenticated
   using (public.has_perm(school_id, 'view_calling_crm')
-         and (assigned_to = auth.uid() or public.has_perm(school_id, 'assign_calling_tasks') or public.has_perm(school_id, 'view_teacher_performance')));
+         and (assigned_to = auth.uid() or auth.uid() = any(co_assignees) or public.has_perm(school_id, 'assign_calling_tasks') or public.has_perm(school_id, 'view_teacher_performance')));
 create policy taskhist_read on public.task_assignment_history for select to authenticated
   using (public.has_perm(school_id, 'assign_calling_tasks') or public.has_perm(school_id, 'view_teacher_performance'));
 create policy calllogs_read on public.calling_logs for select to authenticated

@@ -6,6 +6,10 @@
 -- A dialer launch is NOT a call: only a saved calling_logs row counts.
 -- =====================================================================
 
+-- A task can be shared by several teachers (assigned_to + co_assignees). One task row = one completion for everybody.
+create or replace function public.task_has_assignee(p_assigned uuid, p_co uuid[], p_user uuid) returns boolean
+language sql immutable as $$ select p_user is not null and (p_user = p_assigned or p_user = any(coalesce(p_co, '{}'))) $$;
+
 -- Statuses that mean a conversation happened (parent was reached)
 create or replace function public.call_is_connected(s text) returns boolean language sql immutable as $$
   select s in ('connected','callback_requested','promised_to_pay','refused','payment_done','dispute')
@@ -16,11 +20,12 @@ $$;
 -- ---------------------------------------------------------------------
 create or replace function public.create_calling_tasks(
   p_session uuid, p_mode text, p_class text default null, p_student_ids uuid[] default null,
-  p_teacher_ids uuid[] default null, p_priority text default 'normal', p_deadline date default null)
+  p_teacher_ids uuid[] default null, p_priority text default 'normal', p_deadline date default null,
+  p_share boolean default false)
 returns jsonb language plpgsql security definer set search_path = public as $$
 declare
   v_sid uuid; c record; v_n int := 0; v_idx int := 0; v_teacher uuid; v_exist int := 0; v_zero int := 0;
-  v_cnt int; t uuid; v_per jsonb := '{}'::jsonb; v_ids uuid[]; v_id uuid;
+  v_cnt int; t uuid; v_per jsonb := '{}'::jsonb; v_ids uuid[]; v_id uuid; v_shared int := 0; ex record; tid2 uuid; v_co uuid[];
 begin
   select school_id into v_sid from public.academic_sessions where id = p_session;
   perform public.require_perm(v_sid, 'assign_calling_tasks');
@@ -45,17 +50,41 @@ begin
     order by e.class_name, s.name
   loop
     if c.pending <= 0 then v_zero := v_zero + 1; continue; end if;
-    if exists (select 1 from public.calling_tasks where school_id = v_sid and session_id = p_session
-               and student_id = c.student_id and status in ('pending','in_progress','promised')) then
+    select * into ex from public.calling_tasks where school_id = v_sid and session_id = p_session
+       and student_id = c.student_id and status in ('pending','in_progress','promised');
+    if found then
+      if p_share then   -- same student, one more teacher: add as co-assignee of the existing task
+        v_co := array(select u from unnest(p_teacher_ids) u where u <> ex.assigned_to and not (u = any(ex.co_assignees)));
+        if cardinality(v_co) > 0 then
+          update public.calling_tasks set co_assignees = co_assignees || v_co where id = ex.id;
+          foreach tid2 in array v_co loop
+            insert into public.task_assignment_history (school_id, task_id, from_user, to_user, changed_by, reason)
+            values (v_sid, ex.id, null, tid2, auth.uid(), 'Added as shared assignee');
+            v_per := jsonb_set(v_per, array[tid2::text], to_jsonb(coalesce((v_per ->> tid2::text)::int, 0) + 1));
+          end loop;
+          v_shared := v_shared + 1; continue;
+        end if;
+      end if;
       v_exist := v_exist + 1; continue;
     end if;
-    v_teacher := p_teacher_ids[(v_idx % cardinality(p_teacher_ids)) + 1];
-    insert into public.calling_tasks (school_id, session_id, student_id, enrollment_id, assigned_to, assigned_by, priority, deadline)
-    values (v_sid, p_session, c.student_id, c.enr, v_teacher, auth.uid(), coalesce(p_priority,'normal'), p_deadline)
+    if p_share then
+      v_teacher := p_teacher_ids[1]; v_co := p_teacher_ids[2:cardinality(p_teacher_ids)];
+    else
+      v_teacher := p_teacher_ids[(v_idx % cardinality(p_teacher_ids)) + 1]; v_co := '{}';
+    end if;
+    insert into public.calling_tasks (school_id, session_id, student_id, enrollment_id, assigned_to, co_assignees, assigned_by, priority, deadline)
+    values (v_sid, p_session, c.student_id, c.enr, v_teacher, v_co, auth.uid(), coalesce(p_priority,'normal'), p_deadline)
     returning id into v_id;
     insert into public.task_assignment_history (school_id, task_id, from_user, to_user, changed_by, reason)
     values (v_sid, v_id, null, v_teacher, auth.uid(), 'Initial assignment');
     v_per := jsonb_set(v_per, array[v_teacher::text], to_jsonb(coalesce((v_per ->> v_teacher::text)::int, 0) + 1));
+    if p_share then
+      foreach tid2 in array v_co loop
+        insert into public.task_assignment_history (school_id, task_id, from_user, to_user, changed_by, reason)
+        values (v_sid, v_id, null, tid2, auth.uid(), 'Initial assignment (shared)');
+        v_per := jsonb_set(v_per, array[tid2::text], to_jsonb(coalesce((v_per ->> tid2::text)::int, 0) + 1));
+      end loop;
+    end if;
     v_idx := v_idx + 1; v_n := v_n + 1;
   end loop;
 
@@ -64,7 +93,7 @@ begin
        (v_per ->> t::text) || ' student(s) assigned to you for fee follow-up', '/app.html#/crm/today',
        'newtask:' || t || ':' || to_char(now(), 'YYYYMMDDHH24MI'));
   end loop;
-  return jsonb_build_object('created', v_n, 'skipped_already_assigned', v_exist, 'skipped_no_pending_fee', v_zero);
+  return jsonb_build_object('created', v_n, 'shared_added', v_shared, 'skipped_already_assigned', v_exist, 'skipped_no_pending_fee', v_zero);
 end $$;
 
 create or replace function public.reassign_task(p_task uuid, p_to uuid, p_reason text default null) returns void
@@ -77,7 +106,7 @@ begin
   if t.status in ('completed','cancelled') then raise exception 'Task is already %', t.status; end if;
   if not public.user_has_perm(p_to, t.school_id, 'make_calls') then raise exception 'Target user cannot make calls'; end if;
   if p_to = t.assigned_to then return; end if;
-  update public.calling_tasks set assigned_to = p_to where id = t.id;
+  update public.calling_tasks set assigned_to = p_to, co_assignees = array_remove(co_assignees, p_to) where id = t.id;
   update public.follow_up_tasks set assigned_to = p_to where task_id = t.id and status in ('pending','overdue');
   insert into public.task_assignment_history (school_id, task_id, from_user, to_user, changed_by, reason)
   values (t.school_id, t.id, t.assigned_to, p_to, auth.uid(), p_reason);
@@ -101,7 +130,7 @@ declare t public.calling_tasks;
 begin
   select * into t from public.calling_tasks where id = p_task for update;
   if not found then raise exception 'Task not found'; end if;
-  if not (t.assigned_to = auth.uid() or public.has_perm(t.school_id, 'assign_calling_tasks')) then
+  if not (public.task_has_assignee(t.assigned_to, t.co_assignees, auth.uid()) or public.has_perm(t.school_id, 'assign_calling_tasks')) then
     raise exception 'Not your task' using errcode = '42501'; end if;
   perform public.require_perm(t.school_id, 'make_calls');
   if t.call_count = 0 then raise exception 'Record at least one call before completing the task'; end if;
@@ -110,6 +139,36 @@ begin
   end if;
   update public.calling_tasks set status = 'completed', completed_at = now() where id = t.id;
   update public.follow_up_tasks set status = 'done', completed_at = now() where task_id = t.id and status in ('pending','overdue');
+end $$;
+
+create or replace function public.add_task_assignee(p_task uuid, p_user uuid) returns void
+language plpgsql security definer set search_path = public as $$
+declare t public.calling_tasks;
+begin
+  select * into t from public.calling_tasks where id = p_task for update;
+  if not found then raise exception 'Task not found'; end if;
+  perform public.require_perm(t.school_id, 'assign_calling_tasks');
+  if t.status in ('completed','cancelled') then raise exception 'Task is already %', t.status; end if;
+  if not public.user_has_perm(p_user, t.school_id, 'make_calls') then raise exception 'Selected user cannot make calls'; end if;
+  if public.task_has_assignee(t.assigned_to, t.co_assignees, p_user) then return; end if;
+  update public.calling_tasks set co_assignees = co_assignees || p_user where id = t.id;
+  insert into public.task_assignment_history (school_id, task_id, from_user, to_user, changed_by, reason)
+  values (t.school_id, t.id, null, p_user, auth.uid(), 'Added as shared assignee');
+  perform public.notify(t.school_id, p_user, 'new_calling_task', 'A calling task was shared with you',
+     'A student was also assigned to you for fee follow-up', '/app.html#/crm/today', 'share:' || t.id || ':' || p_user);
+end $$;
+
+create or replace function public.remove_task_assignee(p_task uuid, p_user uuid) returns void
+language plpgsql security definer set search_path = public as $$
+declare t public.calling_tasks;
+begin
+  select * into t from public.calling_tasks where id = p_task for update;
+  if not found then raise exception 'Task not found'; end if;
+  perform public.require_perm(t.school_id, 'assign_calling_tasks');
+  if p_user = t.assigned_to then raise exception 'Use Reassign to change the main assignee'; end if;
+  update public.calling_tasks set co_assignees = array_remove(co_assignees, p_user) where id = t.id;
+  insert into public.task_assignment_history (school_id, task_id, from_user, to_user, changed_by, reason)
+  values (t.school_id, t.id, p_user, null, auth.uid(), 'Removed shared assignee');
 end $$;
 
 create or replace function public.set_teacher_target(p_teacher uuid, p_daily int, p_from date default null) returns void
@@ -151,7 +210,7 @@ begin
   if p_task is not null then
     select * into t from public.calling_tasks where id = p_task and school_id = v_sid and student_id = p_student for update;
     if not found then raise exception 'Task not found for this student'; end if;
-    if t.assigned_to <> auth.uid() and not public.has_perm(v_sid, 'assign_calling_tasks') then
+    if not public.task_has_assignee(t.assigned_to, t.co_assignees, auth.uid()) and not public.has_perm(v_sid, 'assign_calling_tasks') then
       raise exception 'This task is assigned to another teacher' using errcode = '42501'; end if;
   elsif not public.has_perm(v_sid, 'assign_calling_tasks') then
     raise exception 'A calling task is required' using errcode = '42501';
@@ -169,7 +228,7 @@ begin
       p_status, p_outcome, p_parent_response, trim(p_remark), p_promised_date, p_next_followup, p_followup_time, p_priority, p_notes)
   returning id into v_log;
 
-  v_assignee := coalesce(t.assigned_to, auth.uid());
+  v_assignee := case when public.task_has_assignee(t.assigned_to, t.co_assignees, auth.uid()) then auth.uid() else coalesce(t.assigned_to, auth.uid()) end;
   select id into v_enr from public.student_session_enrollments where student_id = p_student and session_id = p_session;
 
   -- this call fulfils follow-ups that were already due
@@ -223,7 +282,7 @@ end $$;
 -- ---------------------------------------------------------------------
 create or replace function public.resolve_student_tasks(p_student uuid, p_session uuid, p_payment uuid default null) returns void
 language plpgsql security definer set search_path = public as $$
-declare pr record; v_paid numeric; v_pending numeric; t record;
+declare pr record; v_paid numeric; v_pending numeric; t record; a uuid;
 begin
   for pr in select * from public.payment_promises where student_id = p_student and session_id = p_session and status in ('pending','overdue') loop
     select coalesce(sum(pa.amount), 0) into v_paid from public.payments py join public.payment_allocations pa on pa.payment_id = py.id
@@ -243,9 +302,11 @@ begin
       update public.follow_up_tasks set status = 'done', completed_at = now() where task_id = t.id and status in ('pending','overdue');
       update public.payment_promises set status = 'kept', resolved_at = now(), resolved_payment_id = p_payment
        where task_id = t.id and status in ('pending','overdue');
-      perform public.notify(t.school_id, t.assigned_to, 'fee_payment_received', 'Fee received - task resolved',
-         'Fee has been fully received for a student on your list. The task was closed automatically.', '/app.html#/crm/history',
-         'resolved:' || t.id);
+      foreach a in array (array[t.assigned_to] || t.co_assignees) loop
+        perform public.notify(t.school_id, a, 'fee_payment_received', 'Fee received - task resolved',
+           'Fee has been fully received for a student on your list. The task was closed automatically.', '/app.html#/crm/history',
+           'resolved:' || t.id || ':' || a);
+      end loop;
     end loop;
   end if;
 end $$;
@@ -397,7 +458,9 @@ begin
            e.class_name, e.section, b.pay_status, (b.overdue_amount > 0) as is_overdue,
            case when v_fin then b.pending end as pending_amount,
            case when v_fin then b.net end as net_fee, case when v_fin then b.paid end as paid_amount,
-           t.id as task_id, t.assigned_to, up.full_name as assigned_name, t.status as task_status, t.priority as task_priority,
+           t.id as task_id, t.assigned_to, t.co_assignees,
+           (select string_agg(p2.full_name, ', ' order by (p2.id <> t.assigned_to), p2.full_name) from public.user_profiles p2
+             where p2.id = t.assigned_to or p2.id = any(t.co_assignees)) as assigned_name, t.status as task_status, t.priority as task_priority,
            t.deadline, t.last_call_at, t.last_status, t.last_remark, coalesce(t.call_count, 0) as call_count,
            coalesce(t.not_answered_streak, 0) as not_answered_streak,
            pr.promised_date, pr.status as promise_status,
@@ -419,7 +482,7 @@ begin
                        where p.enrollment_id = e.id and p.status in ('pending','overdue') order by p.promised_date limit 1) pr on true
     where e.school_id = v_sid and e.session_id = p_session and e.status = 'active' and s.status = 'active'
       and b.pending > 0                                   -- RTE / zero-fee / fully paid never appear
-      and (p_scope <> 'mine' or t.assigned_to = auth.uid())
+      and (p_scope <> 'mine' or public.task_has_assignee(t.assigned_to, t.co_assignees, auth.uid()))
       and (p_scope <> 'unassigned' or t.id is null)
       and (p_class is null or e.class_name = p_class)
       and (v_q is null or s.name ilike '%' || v_q || '%' or s.father_name ilike '%' || v_q || '%'
@@ -554,15 +617,15 @@ begin
     'students_requiring_calls', (select count(*) from public.student_session_enrollments e
         join public.v_enrollment_balances b on b.enrollment_id = e.id join public.students s on s.id = e.student_id
         where e.school_id = v_sid and e.session_id = p_session and e.status = 'active' and s.status = 'active' and b.pending > 0
-          and (v_admin or exists (select 1 from public.calling_tasks t where t.enrollment_id = e.id and t.assigned_to = v_me
+          and (v_admin or exists (select 1 from public.calling_tasks t where t.enrollment_id = e.id and public.task_has_assignee(t.assigned_to, t.co_assignees, v_me)
                                   and t.status in ('pending','in_progress','promised')))),
     'pending_tasks', (select count(*) from public.calling_tasks where school_id = v_sid and session_id = p_session
-        and status in ('pending','in_progress','promised') and (v_admin or assigned_to = v_me)),
+        and status in ('pending','in_progress','promised') and (v_admin or public.task_has_assignee(assigned_to, co_assignees, v_me))),
     'calls_today', v_calls_today,
     'completed_tasks', (select count(*) from public.calling_tasks where school_id = v_sid and session_id = p_session
-        and status = 'completed' and (v_admin or assigned_to = v_me)),
+        and status = 'completed' and (v_admin or public.task_has_assignee(assigned_to, co_assignees, v_me))),
     'not_called', (select count(*) from public.calling_tasks where school_id = v_sid and session_id = p_session
-        and status in ('pending','in_progress','promised') and call_count = 0 and (v_admin or assigned_to = v_me)),
+        and status in ('pending','in_progress','promised') and call_count = 0 and (v_admin or public.task_has_assignee(assigned_to, co_assignees, v_me))),
     'connected_calls', v_conn, 'not_connected_calls', v_notconn,
     'promised_pending', (select count(*) from public.payment_promises where school_id = v_sid and session_id = p_session
         and status = 'pending' and (v_admin or promised_by_user = v_me)),
@@ -575,7 +638,7 @@ begin
     'followups_overdue', (select count(*) from public.follow_up_tasks where school_id = v_sid and session_id = p_session
         and status = 'overdue' and (v_admin or assigned_to = v_me)),
     'tasks_overdue', (select count(*) from public.calling_tasks where school_id = v_sid and session_id = p_session
-        and status in ('pending','in_progress','promised') and deadline < v_today and (v_admin or assigned_to = v_me)),
+        and status in ('pending','in_progress','promised') and deadline < v_today and (v_admin or public.task_has_assignee(assigned_to, co_assignees, v_me))),
     'promise_made', (select count(*) from public.payment_promises where school_id = v_sid and session_id = p_session
         and status <> 'cancelled' and (v_admin or promised_by_user = v_me)),
     'promise_kept', (select count(*) from public.payment_promises where school_id = v_sid and session_id = p_session
@@ -631,11 +694,12 @@ begin
     from public.calling_logs l where l.school_id = v_sid and l.session_id = p_session
       and (l.called_at at time zone 'Asia/Kolkata')::date between v_from and v_to group by l.called_by
   ), tasks as (
-    select assigned_to, count(*) filter (where status <> 'cancelled') assigned_tasks,
+    select u.uid as assigned_to, count(*) filter (where status <> 'cancelled') assigned_tasks,
            count(distinct student_id) filter (where status in ('pending','in_progress','promised')) assigned_students,
            count(*) filter (where status in ('pending','in_progress','promised') and deadline < v_today) overdue_tasks,
            count(*) filter (where status = 'completed') completed_tasks
-    from public.calling_tasks where school_id = v_sid and session_id = p_session group by assigned_to
+    from public.calling_tasks cross join lateral unnest(array[assigned_to] || co_assignees) as u(uid)
+    where school_id = v_sid and session_id = p_session group by u.uid
   ), fu as (
     select assigned_to, count(*) filter (where status = 'done') done,
            count(*) filter (where status = 'done' and completed_at at time zone 'Asia/Kolkata' <= (due_date + 1)::timestamp) on_time,

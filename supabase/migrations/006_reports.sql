@@ -296,12 +296,13 @@ begin
          join public.user_profiles up on up.id = x.called_by), '[]'::jsonb),
     'teachers_incomplete', coalesce((select jsonb_agg(jsonb_build_object('teacher', up.full_name, 'open_tasks', x.open_tasks,
             'followups_overdue', x.overdue, 'calls_in_period', x.calls) order by x.overdue desc)
-         from (select t.assigned_to,
+         from (select u.uid as assigned_to,
                  count(*) filter (where t.status in ('pending','in_progress','promised')) open_tasks,
-                 (select count(*) from public.follow_up_tasks f where f.assigned_to = t.assigned_to and f.session_id = p_session and f.status = 'overdue') overdue,
-                 (select count(*) from public.calling_logs l where l.called_by = t.assigned_to and l.session_id = p_session
+                 (select count(*) from public.follow_up_tasks f where f.assigned_to = u.uid and f.session_id = p_session and f.status = 'overdue') overdue,
+                 (select count(*) from public.calling_logs l where l.called_by = u.uid and l.session_id = p_session
                     and (l.called_at at time zone 'Asia/Kolkata')::date between p_from and p_to) calls
-               from public.calling_tasks t where t.school_id = v_sid and t.session_id = p_session group by t.assigned_to) x
+               from public.calling_tasks t cross join lateral unnest(array[t.assigned_to] || t.co_assignees) as u(uid)
+               where t.school_id = v_sid and t.session_id = p_session group by u.uid) x
          join public.user_profiles up on up.id = x.assigned_to
          where x.open_tasks > 0 and (x.calls = 0 or x.overdue > 0)), '[]'::jsonb)) into res;
   return res;

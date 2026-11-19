@@ -585,6 +585,7 @@ create table public.calling_tasks (
   student_id       uuid not null,
   enrollment_id    uuid not null,
   assigned_to      uuid not null references auth.users(id),
+  co_assignees     uuid[] not null default '{}',   -- extra teachers sharing the SAME task (one completion closes it for all)
   assigned_by      uuid references auth.users(id),
   status           text not null default 'pending' check (status in ('pending','in_progress','promised','completed','cancelled')),
   priority         text not null default 'normal' check (priority in ('low','normal','high','urgent')),

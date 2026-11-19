@@ -12,8 +12,8 @@ js/supabase-config.js                            ONLY config file (URL + anon ke
 js/*.js                                          modules: students, fees, payments, receipts, calling-crm, reports, admin...
 css/app.css
 supabase/ALL_IN_ONE.sql                          all migrations in ONE paste-and-run file
-supabase/migrations/001..009                     schema, functions, RLS, storage, no-CLI user admin
-supabase/tests/run_tests.sql                     129 DB tests
+supabase/migrations/001..010                     schema, functions, RLS, storage, no-CLI user admin, delete + shared tasks
+supabase/tests/run_tests.sql                     153 DB tests
 supabase/seed.sql                                demo data functions (never auto-run)
 templates/students-import-template.csv
 ```
